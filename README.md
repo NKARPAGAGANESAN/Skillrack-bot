@@ -27,10 +27,12 @@ bot/llm_adapter.py
 
 🚀 Running the Bot
 python bot/main.py
+
 📁 Project Guidelines
 Keep sensitive data (API keys) in .env or secure storage
 Ensure Java solutions use public class Hello
 Use logs or screenshots for debugging failures
+
 ⚠️ Disclaimer
 
 This project is intended for educational and experimental purposes only. Ensure compliance with SkillRack’s terms of service before using automation tools.
