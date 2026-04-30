@@ -13,17 +13,7 @@ load_dotenv()
 # ================= CONFIG =================
 # Gemini API Keys Pool (Rotating)
 GEMINI_KEYS = [
-    "AIzaSyDOappr8f6GuRqA869tTBGp7-lDrP9teG4",
-    "AIzaSyBPKKGiEjaoWhAZxeyeGJxdHR-qhe654jA",
-    "AIzaSyDWFmBY5qKqDGiz1FVv9tpm63p-W-2GeW4",
-    "AIzaSyDScHcvsrRgLeCTXl2umsH_TzbmikOfEB",
-    "AIzaSyD2CBOLEYTrW0D-KmSeyOqKEMLbHxxx76o",
-    "AIzaSyBy6ApxIZLW69V86wlNIN2JL0ROZ_WlVF4",
-    "AIzaSyDXpRyGs4Q78MqtdX7P_3jT_KvpV2GVTLY",
-    "AIzaSyDXFjWW8_7rvdmhAb0JrmjCEGBuuQeJCi0",
-    "AIzaSyD0WTEj6mRRx9OlfNnzOGkZHa7puB-z_KU",
-    "AIzaSyDScHcvsrRgLeCTXl2umsH_TzbmikOfEB",
-    "AQ.Ab8RN6I0FMcoslGBW0UseaSJLiTBXC2J4GUBRs4kCX0TENAhDg"
+   ADD_YOUR_10_GEMENIAPIKEYS_HERE
 ]
 
 # Add key from .env if present
