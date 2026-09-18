@@ -12,7 +12,7 @@ try:
     import pytesseract
     from PIL import Image
     # Updated path for Tesseract on D: drive
-    pytesseract.pytesseract.tesseract_cmd = r'D:\Tesseract\tesseract.exe'
+    pytesseract.pytesseract.tesseract_cmd = r''#load pytesseract directory here 
 except ImportError:
     pytesseract = None
 
