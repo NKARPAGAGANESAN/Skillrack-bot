@@ -34,21 +34,32 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "auto").strip().lower()
 # Keep disabled by default; Ambiance often blocks paste operations.
 MANUAL_PASTE_FALLBACK = os.getenv("MANUAL_PASTE_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
-TYPE_DELAY_MS = int(os.getenv("TYPE_DELAY_MS", "18"))
-ENABLE_SAMPLE_CHECK = os.getenv("ENABLE_SAMPLE_CHECK", "0").strip().lower() in ("1", "true", "yes")
+TYPE_DELAY_MS = int(os.getenv("TYPE_DELAY_MS", "2"))
+ENABLE_SAMPLE_CHECK = os.getenv("ENABLE_SAMPLE_CHECK", "1").strip().lower() in ("1", "true", "yes")
 SAMPLE_CHECK_TIMEOUT_SEC = int(os.getenv("SAMPLE_CHECK_TIMEOUT_SEC", "3"))
 
 
 # ================= HELPERS =================
 def _normalize_code_indentation(code: str) -> str:
+    """Aggressively fixes indentation and removes common LLM artifacts."""
+    if not code: return ""
+    
+    # Remove markdown code fences if they survived extraction
+    code = re.sub(r"```[a-zA-Z]*\n?", "", code).replace("```", "")
+    
+    # Normalize line endings and non-breaking spaces
     code = code.replace("\r", "").replace("\u00A0", " ")
+    
     lines = code.split("\n")
     cleaned = []
     for ln in lines:
+        # Remove any leading '>' characters from LLM blockquotes
         ln = re.sub(r"^\s*>\s*", "", ln)
+        # Convert tabs to 4 spaces consistently
         ln = ln.replace("\t", "    ")
         cleaned.append(ln.rstrip())
 
+    # Remove global indentation if all lines are indented (common in LLM responses)
     non_blank = [l for l in cleaned if l.strip()]
     if non_blank:
         indents = [len(re.match(r"^( *)", l).group(1)) for l in non_blank]
@@ -60,6 +71,7 @@ def _normalize_code_indentation(code: str) -> str:
         cleaned.pop(0)
     while cleaned and not cleaned[-1].strip():
         cleaned.pop()
+        
     return "\n".join(cleaned)
 
 
@@ -106,41 +118,28 @@ def extract_text_via_ocr(page) -> str:
         screenshot_path = "problem_ocr.png"
         container.screenshot(path=screenshot_path)
         
-        # Crop the image to remove the top navigation bar and RIGHT side (editor junk)
+        # KEEP FULL WIDTH (Examples are often on the right!)
         try:
             img = Image.open(screenshot_path)
             width, height = img.size
-            # Only keep the left 60% of the screen (problem description)
-            # And skip the top 120px (nav bars)
-            left = 0
-            top = 120
-            right = int(width * 0.6)
-            bottom = height
-            img = img.crop((left, top, right, bottom))
+            # Only skip the top nav bar, keep 100% width
+            img = img.crop((0, 120, width, height))
             img.save(screenshot_path)
         except Exception as e:
             print(f"[!] Cropping failed: {e}")
 
-        # Open image and extract text
         print("[*] Running Pytesseract OCR...")
         text = pytesseract.image_to_string(Image.open(screenshot_path))
         
-        # CLEANUP OCR: Remove line numbers (1-, 2-) and common UI junk
-        text = re.sub(r"^\s*\d+\s*-\s*", "", text, flags=re.MULTILINE) # Remove "1- ", "2- "
+        # CLEANUP OCR
+        text = re.sub(r"^\s*\d+\s*-\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"Valid Till:.*", "", text)
         text = re.sub(r"Home \| Reports.*", "", text)
         
-        # DEBUG: Show the text
-        print(f"\n--- OCR TEXT CAPTURED ---\n{text}\n------------------------\n")
+        print(f"\n--- OCR TEXT CAPTURED ---\n{text[:500]}...\n------------------------\n")
         
-        # Basic cleanup
         text = re.sub(r'\n{3,}', '\n\n', text).strip()
-        if len(text) > 50:
-            print(f"[+] OCR Success ({len(text)} chars)")
-            return text
-        else:
-            print("[!] OCR returned too little text. Falling back.")
-            return ""
+        return text
     except Exception as e:
         print(f"[!] OCR Error: {e}")
         return ""
@@ -151,42 +150,31 @@ def compact_problem_text(raw_text: str) -> str:
     if not txt.strip():
         return txt
 
-    # Only remove UI chrome, not problem content
+    # Only remove UI navigation chrome, preserving full problem, constraints, and examples
     noise_patterns = [
         r"\bHome\s+Reports\s+Profile\s+Help\s+Logout\b",
         r"\bui-button\b",
         r"Back To Challenges List",
         r"Valid Till:\s*[^\n]+",
-        r"Run with a custom test case",
+        r"Run with a custom test case(\s*\(Input/Output\))?",
         r"Save\s+Run\s+Submit(?!ted)",
+        r"Ambiance\s+[A-Za-z0-9_().+\s-]+\b",
     ]
     for pat in noise_patterns:
         txt = re.sub(pat, " ", txt, flags=re.IGNORECASE)
 
     # Normalize whitespace but preserve structure
     txt = re.sub(r"[ \t]+", " ", txt)
-    txt = re.sub(r"\n{4,}", "\n\n", txt).strip()
+    txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
 
-    # Look for problem statement (keep most content)
-    start_markers = ["Problem Statement:", "The program must", "Input Format:", "Description:"]
-    end_markers = ["Max Execution Time Limit", "Memory Limit", "Constraints:"]  # Conservative ending
+    # If Max Execution Time Limit is present at the end of the problem container, trim after it
+    time_limit_idx = txt.lower().find("max execution time limit")
+    if time_limit_idx != -1:
+        end_idx = txt.find("\n", time_limit_idx)
+        if end_idx != -1:
+            txt = txt[:end_idx].strip()
 
-    start_idx = -1
-    for m in start_markers:
-        i = txt.lower().find(m.lower())
-        if i != -1:
-            start_idx = i if start_idx == -1 else min(start_idx, i)
-
-    if start_idx == -1:
-        return txt  # Return full text if no clear markers found
-
-    end_idx = len(txt)
-    for m in end_markers:
-        i = txt.lower().find(m.lower(), start_idx)
-        if i != -1:
-            end_idx = min(end_idx, i)
-
-    return txt[start_idx:end_idx].strip()
+    return txt.strip()
 
 
 def get_selected_language(page) -> str:
@@ -198,13 +186,14 @@ def get_selected_language(page) -> str:
                 const labels = [...document.querySelectorAll(".ui-selectonemenu-label")]
                     .map((el) => norm(el.textContent))
                     .filter(Boolean);
-                const pick = labels.find((t) => /java|python|cpp|c\+\+|^\s*c\s*\(/i.test(t));
+                // Robust check for Java, Python, CPP, and standalone C
+                const pick = labels.find((t) => /java|python|cpp|c\+\+|\bC\b|^\s*c\s*\(/i.test(t));
                 if (pick) return pick;
 
                 const sel = document.querySelector("select");
                 if (sel) {
                     const selected = sel.options?.[sel.selectedIndex]?.text || sel.value || "";
-                    if (/java|python|cpp|c\+\+|^\s*c\s*\(/i.test(selected)) return norm(selected);
+                    if (/java|python|cpp|c\+\+|\bC\b|^\s*c\s*\(/i.test(selected)) return norm(selected);
                 }
                 return "";
             }
@@ -216,123 +205,247 @@ def get_selected_language(page) -> str:
 
 
 def get_editor_starter_code(page) -> str:
-    try:
-        txt = page.evaluate(
-            """
-            () => {
-                const aceRoot = document.querySelector(".ace_editor");
-                if (aceRoot && window.ace) {
-                    try { return window.ace.edit(aceRoot).getValue() || ""; } catch (_) {}
-                }
-                if (window.monaco?.editor?.getModels?.()?.length) {
-                    return window.monaco.editor.getModels()[0].getValue() || "";
-                }
-                const ta = [...document.querySelectorAll("textarea")].find((el) => {
-                    const r = el.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0 && el.offsetParent !== null;
-                });
-                if (ta) return ta.value || "";
-                const cm = document.querySelector(".CodeMirror");
-                if (cm && cm.CodeMirror) return cm.CodeMirror.getValue() || "";
-                return "";
+    """Read current code from editor (Ace, Monaco, CodeMirror, or textarea)."""
+    get_code_js = """
+        () => {
+            // 1. Check Ace editors
+            const aceEls = document.querySelectorAll('.ace_editor');
+            for (const el of aceEls) {
+                try {
+                    if (window.ace && window.ace.edit) {
+                        const val = window.ace.edit(el).getValue();
+                        if (val && val.trim()) return val;
+                    }
+                } catch(e) {}
+                try {
+                    if (el.env && el.env.editor) {
+                        const val = el.env.editor.getValue();
+                        if (val && val.trim()) return val;
+                    }
+                } catch(e) {}
             }
-            """
-        )
-        return _normalize_code_indentation((txt or "").strip())
+            // 2. Monaco
+            if (window.monaco?.editor?.getModels?.()?.length) {
+                try { return window.monaco.editor.getModels()[0].getValue() || ""; } catch(e) {}
+            }
+            // 3. CodeMirror
+            const cm = document.querySelector(".CodeMirror");
+            if (cm && cm.CodeMirror) {
+                try { return cm.CodeMirror.getValue() || ""; } catch(e) {}
+            }
+            // 4. Regular textarea (exclude Ace's 1x1 hidden input textarea)
+            const tas = [...document.querySelectorAll("textarea")].filter(el => !el.classList.contains("ace_text-input"));
+            for (const ta of tas) {
+                const r = ta.getBoundingClientRect();
+                if (r.width > 50 && r.height > 50) return ta.value || "";
+            }
+            return "";
+        }
+    """
+    try:
+        frames_to_check = [page]
+        try:
+            frames_to_check.extend(page.frames)
+        except Exception:
+            pass
+        for frame in frames_to_check:
+            try:
+                txt = frame.evaluate(get_code_js)
+                if txt and txt.strip():
+                    return _normalize_code_indentation(txt.strip())
+            except Exception:
+                continue
     except Exception:
-        return ""
+        pass
+    return ""
 
 
 def type_solution_code(page, code: str, language: str = ""):
-    """Type solution into editor with high reliability for Ace/Skillrack (including iframes)."""
+    """Insert solution into Ambiance editor cleanly with zero auto-indent drift, zero line collisions, and zero duplicate braces."""
     print("[+] Typing solution code into editor...")
     try:
         code = _normalize_code_indentation(code)
         
-        # AUTO-PREPEND JAVA IMPORTS (The "Safety Net")
+        # AUTO-PREPEND JAVA IMPORTS
         if "java" in language.lower() and "import java.util" not in code:
-            print("[*] Auto-prepending missing Java imports...")
             code = "import java.util.*;\nimport java.util.stream.*;\n" + code
 
         if not code.strip():
             print("[!] ERROR: Code is empty")
             return False
 
-        # Physical Typing is often more reliable for SkillRack's complex iframes
-        page.bring_to_front()
-        time.sleep(1)
-        
-        # 1. Try to find a VISIBLE editor in any frame
-        target_frame = page
-        target_element = None
-        selectors = [".ace_content", ".ace_editor", "textarea.ace_text-input", "#txtCode", "textarea"]
-        
-        def find_visible(root):
-            for sel in selectors:
-                try:
-                    loc = root.locator(sel)
-                    for i in range(loc.count()):
-                        el = loc.nth(i)
-                        if el.is_visible(timeout=100):
-                            return el
-                except: continue
-            return None
+        # Always copy code to Windows clipboard first as a safety net
+        copy_to_clipboard(code)
 
-        # Try main page
-        target_element = find_visible(page)
-        if not target_element:
-            # Try all frames
-            for frame in page.frames:
-                target_element = find_visible(frame)
-                if target_element:
-                    target_frame = frame
-                    print(f"[*] Found visible editor in iframe: {frame.url[:50]}...")
-                    break
-
-        # Fallback: just take the first one if none are "visible"
-        if not target_element:
-            for sel in selectors:
-                try:
-                    el = page.locator(sel).first
-                    if el.count() > 0:
-                        target_element = el
-                        break
-                except: continue
-
-        if not target_element:
-            print("[!] Could not find any editor element.")
-            return False
-
-        # 2. Focus and Clear
+        # Collect all frames to inspect (main page + all child frames)
+        all_frames = [page]
         try:
-            # Force focus via JS
-            target_element.evaluate("el => { el.focus(); el.click(); }")
-            time.sleep(0.5)
-            
-            # Physical click as backup
-            box = target_element.bounding_box()
-            if box and target_element.is_visible():
-                target_frame.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-            else:
-                target_element.click(force=True)
-                
-            time.sleep(0.5)
-            target_frame.keyboard.press("Control+A")
-            time.sleep(0.2)
-            target_frame.keyboard.press("Backspace")
-            time.sleep(0.3)
-            
-            # 3. Type code character-by-character
-            print("[*] Typing code physically...")
-            target_frame.keyboard.type(code, delay=0)
-            print("[+] Code typed into editor.")
-            return True
-        except Exception as e:
-            print(f"[!] Typing failed: {e}")
-            return False
-        except Exception as e:
-            print(f"[!] Typing failed: {e}")
-            return False
+            all_frames.extend(page.frames)
+        except Exception:
+            pass
+
+        # -------------------------------------------------------------
+        # STEP 1: Disable Ace auto-indent, auto-pairing, & outdent rules
+        # -------------------------------------------------------------
+        disable_behaviors_js = """
+        () => {
+            let count = 0;
+            const aceEls = document.querySelectorAll('.ace_editor');
+            aceEls.forEach(el => {
+                let ed = el.env ? el.env.editor : null;
+                if (!ed && window.ace && typeof window.ace.edit === 'function') {
+                    try { ed = window.ace.edit(el); } catch(e) {}
+                }
+                if (ed) {
+                    try {
+                        ed.setBehavioursEnabled(false);
+                        if (ed.session && ed.session.getMode()) {
+                            let m = ed.session.getMode();
+                            m.getNextLineIndent = function() { return ""; };
+                            m.checkOutdent = function() { return false; };
+                            m.autoOutdent = function() {};
+                            let proto = Object.getPrototypeOf(m);
+                            if (proto) {
+                                proto.getNextLineIndent = function() { return ""; };
+                                proto.checkOutdent = function() { return false; };
+                                proto.autoOutdent = function() {};
+                            }
+                        }
+                        count++;
+                    } catch(e) {}
+                }
+            });
+            return count;
+        }
+        """
+        for frame in all_frames:
+            try:
+                frame.evaluate(disable_behaviors_js)
+            except Exception:
+                pass
+
+        # -------------------------------------------------------------
+        # STEP 2: Method A - Direct Ace API Injection (Instant & exact)
+        # -------------------------------------------------------------
+        inject_js = """
+        (newCode) => {
+            let setAny = false;
+            const aceEls = document.querySelectorAll('.ace_editor');
+            aceEls.forEach(el => {
+                let ed = el.env ? el.env.editor : null;
+                if (!ed && window.ace && typeof window.ace.edit === 'function') {
+                    try { ed = window.ace.edit(el); } catch(e) {}
+                }
+                if (ed) {
+                    try {
+                        ed.setValue(newCode, -1);
+                        ed.clearSelection();
+                        if (ed.getSession()) {
+                            ed.getSession().setValue(newCode);
+                            try { ed.getSession()._emit('change', {}); } catch(e) {}
+                        }
+                        setAny = true;
+                    } catch(e) {}
+                }
+            });
+            return setAny;
+        }
+        """
+        read_js = """
+        () => {
+            const aceEls = document.querySelectorAll('.ace_editor');
+            for (const el of aceEls) {
+                try {
+                    let ed = el.env ? el.env.editor : null;
+                    if (!ed && window.ace && typeof window.ace.edit === 'function') {
+                        try { ed = window.ace.edit(el); } catch(e) {}
+                    }
+                    if (ed) {
+                        let v = ed.getValue();
+                        if (v && v.trim()) return v;
+                    }
+                } catch(e) {}
+            }
+            return "";
+        }
+        """
+        for frame in all_frames:
+            try:
+                frame.evaluate(inject_js, code)
+            except Exception:
+                pass
+
+        # Verify whether direct API set the code
+        for frame in all_frames:
+            try:
+                cur = frame.evaluate(read_js)
+                if cur and cur.strip() == code.strip():
+                    print(f"[+] Code cleanly set in Ambiance editor via Ace API ({len(code.splitlines())} lines).")
+                    try:
+                        page.bring_to_front()
+                        inp = frame.locator(".ace_editor textarea.ace_text-input").first
+                        if inp.count() > 0:
+                            inp.focus()
+                    except Exception:
+                        pass
+                    return True
+            except Exception:
+                continue
+
+        # -------------------------------------------------------------
+        # STEP 3: Method B - Physical Typing with Zero-Indentation Drift
+        # -------------------------------------------------------------
+        print(f"[*] Physically typing {len(code.splitlines())} lines into Ambiance editor...")
+        page.bring_to_front()
+
+        # Focus editor via JS first
+        focus_js = """
+        () => {
+            const aceEls = document.querySelectorAll('.ace_editor');
+            for (const el of aceEls) {
+                let ed = el.env ? el.env.editor : null;
+                if (!ed && window.ace && typeof window.ace.edit === 'function') {
+                    try { ed = window.ace.edit(el); } catch(e) {}
+                }
+                if (ed) {
+                    try { ed.focus(); return true; } catch(e) {}
+                }
+            }
+            return false;
+        }
+        """
+        for frame in all_frames:
+            try:
+                if frame.evaluate(focus_js):
+                    break
+            except Exception:
+                pass
+
+        # Also focus the Ace input element
+        ace_input = page.locator('.ace_editor textarea.ace_text-input').first
+        if ace_input.count() > 0:
+            try:
+                ace_input.focus()
+                time.sleep(0.05)
+            except Exception:
+                pass
+
+        # Clear existing starter code thoroughly
+        page.keyboard.press("Control+A")
+        time.sleep(0.05)
+        page.keyboard.press("Backspace")
+        time.sleep(0.05)
+
+        # Type lines verbatim
+        lines = code.splitlines()
+        for i, line in enumerate(lines):
+            if line:
+                page.keyboard.type(line, delay=TYPE_DELAY_MS)
+            if i < len(lines) - 1:
+                page.keyboard.press("Enter")
+
+        print(f"[+] Code cleanly typed into Ambiance editor ({len(lines)} lines).")
+        return True
 
     except Exception as e:
         print(f"[!] Error in typing workflow: {e}")
@@ -573,17 +686,20 @@ def extract_code_from_response(response: str, language: str = ""):
             return largest.strip()
             
     # 2. Heuristic extraction for Java (look for imports/class)
+    is_c = bool(re.search(r"\bC\b|^\s*c\s*\(", lang, re.IGNORECASE)) and "c++" not in lang and "cpp" not in lang
     if is_java:
         match = re.search(r"(import\s+java[\s\S]*?public\s+class\s+Hello[\s\S]*\}\s*$)", response, re.DOTALL)
         if match:
             return match.group(1).strip()
-        # Fallback to finding class Hello
         match = re.search(r"(public\s+class\s+Hello[\s\S]*\}\s*$)", response, re.DOTALL)
         if match:
             return match.group(1).strip()
+    elif is_c:
+        match = re.search(r"(#include\s*<[\s\S]*?int\s+main\s*\([^)]*\)[\s\S]*\}\s*$)", response, re.DOTALL)
+        if match:
+            return match.group(1).strip()
 
-    # 3. Last resort: just strip any text that clearly isn't code from top/bottom
-    # If the response starts with "Here is the code..." etc.
+    # 3. Last resort: strip any non-code explanation text from top
     lines = response.strip().splitlines()
     code_lines = []
     in_code = False
@@ -594,26 +710,33 @@ def extract_code_from_response(response: str, language: str = ""):
             if is_java:
                 if l.startswith("import ") or l.startswith("public class ") or l.startswith("class "):
                     in_code = True
+            elif is_c:
+                if l.startswith("#include") or "int main" in l or "void main" in l or l.startswith("char ") or l.startswith("int ") or l.startswith("//"):
+                    in_code = True
             else: # Python
-                if l.startswith("import ") or l.startswith("from ") or l.startswith("def ") or l.startswith("n =") or l.startswith("x ="):
+                if l.startswith("import ") or l.startswith("from ") or l.startswith("def ") or l.startswith("n =") or l.startswith("x =") or l.startswith("#"):
                     in_code = True
         
         if in_code:
             code_lines.append(line)
             
     if code_lines:
-        return "\n".join(code_lines).strip()
+        extracted = "\n".join(code_lines).strip()
+        if is_c and "main(" not in extracted:
+            extracted = "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\nint main() {\n" + extracted + "\n    return 0;\n}"
+        return extracted
         
     return response.strip()
 
 
-def solve_problem(problem_text: str, language: str = "", starter_code: str = "", screenshot_path: str | None = None):
+def solve_problem(problem_text: str, language: str = "", starter_code: str = "", screenshot_path: str | None = None, smart_priority: bool = False):
     """Generate solution code. The llm_adapter already handles extraction and wrapping."""
     code = generate_solution(
         problem_text,
         screenshot_path=screenshot_path,
         language=language,
         starter_code=starter_code,
+        smart_priority=smart_priority,
     )
     
     if not code or len(code.strip()) < 10:
@@ -628,14 +751,9 @@ def solve_problem(problem_text: str, language: str = "", starter_code: str = "",
                 "Convert this into valid Java code only.\n"
                 "Return the FULL class Hello from scratch.\n"
                 f"Problem:\n{problem_text}\n\n"
-                f"Current code:\n```text\n{code}\n```"
+                f"Bad Code:\n{code}"
             )
-            code = generate_solution(
-                fix_prompt,
-                screenshot_path=screenshot_path,
-                language=language,
-                starter_code=starter_code,
-            )
+            code = generate_solution(fix_prompt, language=language, smart_priority=True)
 
     if "python" not in (language or "").lower():
         return code
@@ -674,11 +792,8 @@ def _extract_sample_io_pairs(problem_text: str, limit: int = 2):
     if not text.strip():
         return []
 
-    def _normalize_one_line(s: str) -> str:
-        return re.sub(r"\s+", " ", (s or "").strip())
-
     def _is_ambiguous(value: str) -> bool:
-        v = _normalize_one_line(value).lower()
+        v = value.strip().lower()
         bad_tokens = (
             "input format",
             "output format",
@@ -692,20 +807,23 @@ def _extract_sample_io_pairs(problem_text: str, limit: int = 2):
 
     pairs = []
     # Matches "Input: ... Output: ..." blocks commonly used in SkillRack.
-    # Keep captures bounded so we don't swallow section headers.
+    # Uses negative lookahead to strictly ignore "Input Format:" and "Output Format:" headers!
     pattern = re.compile(
-        r"Input\s*:?\s*(.*?)\s*Output\s*:?\s*(.*?)(?=(?:Explanation\s*:|Example\s*\d+\s*:|Input\s*:|Output\s*:|$))",
-        flags=re.IGNORECASE | re.DOTALL,
+        r'(?:Example\s*(?:Input/Output)?\s*\d*[:\s]*)?'
+        r'(?<![A-Za-z])Input(?!\\s*format)\s*:\s*\n?'
+        r'(.*?)\n?'
+        r'(?<![A-Za-z])Output(?!\\s*format)\s*:\s*\n?'
+        r'(.*?)(?=(?:Explanation\s*:|Example\s*(?:Input/Output)?\s*\d*[:\s]|(?<![A-Za-z])Input(?!\\s*format)\s*:|Max Execution|$))',
+        flags=re.IGNORECASE | re.DOTALL
     )
     for m in pattern.finditer(text):
-        inp = _normalize_one_line(m.group(1))
-        out = _normalize_one_line(m.group(2))
-        # Guard against malformed extraction from compacted text.
-        if _is_ambiguous(inp) or _is_ambiguous(out):
+        raw_inp = m.group(1).strip()
+        raw_out = m.group(2).strip()
+        if _is_ambiguous(raw_inp) or _is_ambiguous(raw_out):
             continue
-        if len(inp) > 120 or len(out) > 120:
+        if len(raw_inp) > 1000 or len(raw_out) > 1000:
             continue
-        pairs.append((inp, out))
+        pairs.append((raw_inp, raw_out))
         if len(pairs) >= limit:
             break
     return pairs
@@ -736,20 +854,22 @@ def _code_passes_sample_checks(code: str, language: str, problem_text: str) -> b
             return False
 
         if result.returncode != 0:
-            print(f"[!] Sample check #{idx} runtime error; retrying with new code.")
+            err_snippet = (result.stderr or "").strip().splitlines()
+            last_err = err_snippet[-1] if err_snippet else "Unknown error"
+            print(f"[!] Sample check #{idx} runtime error ({last_err}); retrying with repaired code.")
             return False
 
-        actual = (result.stdout or "").strip()
-        want = (expected or "").strip()
-        if actual != want:
-            print(f"[!] Sample check #{idx} mismatch: got '{actual}' expected '{want}'")
+        actual_lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+        want_lines = [l.strip() for l in expected.strip().splitlines() if l.strip()]
+        if actual_lines != want_lines:
+            print(f"[!] Sample check #{idx} mismatch: got '{' '.join(actual_lines)}' expected '{' '.join(want_lines)}'")
             return False
 
     print("[+] Sample I/O checks passed")
     return True
 
 
-def solve_problem_with_retry(problem_text: str, language: str = "", starter_code: str = "", screenshot_path: str | None = None, max_attempts: int = 3):
+def solve_problem_with_retry(problem_text: str, language: str = "", starter_code: str = "", screenshot_path: str | None = None, max_attempts: int = 3, smart_priority: bool = False):
     """Generate solution with validation retries until valid code is obtained."""
     last_code = ""
     fallback_code = ""
@@ -758,7 +878,7 @@ def solve_problem_with_retry(problem_text: str, language: str = "", starter_code
         print(f"[*] LLM attempt {attempt + 1}/{max_attempts}")
 
         try:
-            code = solve_problem(problem_text, language, starter_code, screenshot_path=screenshot_path)
+            code = solve_problem(problem_text, language, starter_code, screenshot_path=screenshot_path, smart_priority=smart_priority)
             if not code or len(code) < 10:
                 continue
             # Keep a non-empty candidate so we can still type something if strict checks fail.
@@ -858,6 +978,18 @@ def run():
             ignore_https_errors=True,
             no_viewport=True,
         )
+        # Neutralize SkillRack's anti-paste blockers while allowing Ace editor to receive paste
+        context.add_init_script("""
+            document.onpaste = null;
+            window.onpaste = null;
+            ['copy', 'cut', 'paste'].forEach(evt => {
+                window.addEventListener(evt, (e) => {
+                    if (e.target && (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT')) {
+                        return;
+                    }
+                }, false);
+            });
+        """)
         page = context.new_page()
 
         print("\n===== SKILLRACK AUTOMATION =====")
@@ -891,8 +1023,8 @@ def run():
                 else:
                     print("    Alternatively, set GROQ_API_KEY for cloud mode.\n")
         
-        # Set to infinite problems by default
-        target_solved = 0
+        # Set target solved problems (default: 200, configurable via TARGET_SOLVED env)
+        target_solved = int(os.getenv("TARGET_SOLVED", "200"))
             
         print(f"[*] Target: {'Infinite' if target_solved == 0 else target_solved} problems")
         
@@ -968,18 +1100,16 @@ def run():
                 else:
                     print(f"[*] No starter code found (fresh problem)")
 
-                # --- OCR STEP ---
-                print("[*] Attempting OCR to save vision tokens...")
+                # --- HYBRID TEXT EXTRACTION ---
+                print("[*] Gathering problem text from multiple sources...")
                 ocr_text = extract_text_via_ocr(page)
+                raw_web_text = extract_problem_text(page)
+                web_text = compact_problem_text(raw_web_text)
                 
-                if ocr_text:
-                    text = ocr_text
-                else:
-                    print("[*] Falling back to webpage text extraction...")
-                    raw_text = extract_problem_text(page)
-                    text = compact_problem_text(raw_text)
-
-                print(f"[*] Final problem text size: {len(text)} chars")
+                # Merge sources: Web text provides the skeleton, OCR provides the visual proof
+                text = f"WEB TEXT:\n{web_text}\n\nOCR TEXT (MAY HAVE TYPOS):\n{ocr_text}"
+                
+                print(f"[*] Combined problem text size: {len(text)} chars")
                 
                 # ... (rest of the solving logic)
                 
@@ -1011,8 +1141,8 @@ def run():
                     choice = (input(">>> ") or "").strip().lower()
                     
                     if choice == "r":
-                        print("[*] Retrying with different logic...")
-                        solution = solve_problem_with_retry(text, language=language, starter_code=starter_code, max_attempts=1)
+                        print("[*] Retrying with different logic (using SMART model)...")
+                        solution = solve_problem_with_retry(text, language=language, starter_code=starter_code, max_attempts=1, smart_priority=True)
                         if solution:
                             print("\n===== NEW AI SOLUTION =====\n")
                             print(solution)
@@ -1059,6 +1189,13 @@ def run():
                         break
                     
                     # Default: Enter to proceed
+                    print("[*] Starting 60s safety timer...")
+                    for i in range(60, -1, -1):
+                        mins, secs = divmod(i, 60)
+                        sys.stdout.write(f"\r[*] Next problem in: {mins:02d}:{secs:02d}  ")
+                        sys.stdout.flush()
+                        time.sleep(1)
+                    print("\n[+] Proceeding to next problem...")
                     break
                 
                 # Logic to proceed to next problem
@@ -1081,24 +1218,6 @@ def run():
                 time.sleep(2)
 
         browser.close()
-
-
-def click_next_button(page):
-    selectors = [
-        "button:has-text('Next')", "a:has-text('Next')", "span:has-text('Next')",
-        ".ui-button:has-text('Next')", "button[id*='next']", "a[id*='next']",
-        "button:has-text('Proceed')", "a:has-text('Proceed')"
-    ]
-    for selector in selectors:
-        try:
-            btn = page.locator(selector).first
-            if btn.is_visible(timeout=1000):
-                print(f"[*] Found Next button via: {selector}")
-                btn.click()
-                return True
-        except Exception:
-            continue
-    return False
 
 
 if __name__ == "__main__":

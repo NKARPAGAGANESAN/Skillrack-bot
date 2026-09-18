@@ -14,6 +14,7 @@ def test_keys():
             client = genai.Client(api_key=key)
             response = client.models.generate_content(
                 model="gemini-1.5-flash",
+                model="gemini-3.6-flash",
                 contents="Say 'OK'",
             )
             print(f"  [+] Success: {response.text.strip()}")

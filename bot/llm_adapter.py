@@ -12,83 +12,117 @@ load_dotenv()
 
 # ================= CONFIG =================
 # Gemini API Keys Pool (Rotating)
+# Only verified active keys are retained in default pool
 GEMINI_KEYS = [
-   ADD_YOUR_10_GEMENIAPIKEYS_HERE
+    "AQ.Ab8RN6LTzMQtKKhTkAne1NLcxqqluow6oxJ22gnAmuH0hJjZsA",
+    "AIzaSyDm2tlqjiZzePcRb17JUerIBY7F_ctvDaw"
 ]
 
-# Add key from .env if present
+# Add primary key from .env if present
 _env_key = os.getenv("GOOGLE_API_KEY")
 if _env_key and _env_key not in GEMINI_KEYS:
     GEMINI_KEYS.insert(0, _env_key)
 
-# Model Definitions - STRICTLY Gemini 2.5 Flash and Flash-Lite
+# Add any additional comma-separated keys from .env
+_extra_keys = os.getenv("GEMINI_API_KEYS", "")
+for k in _extra_keys.split(","):
+    k = k.strip()
+    if k and k not in GEMINI_KEYS:
+        GEMINI_KEYS.append(k)
+
+# Model Definitions - Gemini 2.5 Flash and Groq models provide reliable, instant generation
 MODELS = [
     {"name": "Gemini 2.5 Flash", "provider": "google", "id": "gemini-2.5-flash"},
-    {"name": "Gemini 2.5 Flash-Lite", "provider": "google", "id": "gemini-2.5-flash-lite"},
+    {"name": "Groq GPT-OSS (120B)", "provider": "groq", "id": "openai/gpt-oss-120b"},
+    {"name": "Groq Qwen 3.8 (27B)", "provider": "groq", "id": "qwen/qwen3.8-27b"},
+    {"name": "Gemini 3.6 Flash", "provider": "google", "id": "gemini-3.6-flash"},
 ]
 
-# State for Key Rotation
+# State for Key Rotation & Health
 _key_index = 0
 _key_usage = {key: [] for key in GEMINI_KEYS} # Track timestamps of requests per key
+_blacklisted_keys = set() # Automatically blacklist invalid (400) or banned (403) keys
 
 def _get_next_valid_key():
     global _key_index
-    start_idx = _key_index
+    available_keys = [k for k in GEMINI_KEYS if k not in _blacklisted_keys]
+    if not available_keys:
+        raise RuntimeError("No valid Gemini API keys available. All keys exhausted or blacklisted.")
     
+    start_idx = _key_index % len(available_keys)
     while True:
-        key = GEMINI_KEYS[_key_index]
+        key = available_keys[_key_index % len(available_keys)]
         now = time.time()
+        
+        # Advance index for the next request attempt
+        _key_index = (_key_index + 1) % len(available_keys)
+        
         # Clean up timestamps older than 60 seconds
         if key not in _key_usage:
             _key_usage[key] = []
         _key_usage[key] = [t for t in _key_usage[key] if now - t < 60]
         
-        # If this key has used fewer than 10 requests in the last minute, use it
-        if len(_key_usage[key]) < 10:
+        # Check RPM limit (12 RPM per key gives a safe buffer under the 15 RPM cap)
+        if len(_key_usage[key]) < 12:
             _key_usage[key].append(now)
-            # Advance index for next time to ensure distribution
-            current_key = key
-            _key_index = (_key_index + 1) % len(GEMINI_KEYS)
-            return current_key
+            return key
             
-        # Move to next key
-        _key_index = (_key_index + 1) % len(GEMINI_KEYS)
-        
-        # If we've checked all keys and they are all busy, wait a bit
-        if _key_index == start_idx:
-            print("[*] All Gemini keys are at the 10 RPM limit. Waiting 10s...")
-            time.sleep(10)
+        if (_key_index % len(available_keys)) == start_idx:
+            print("[*] All healthy Gemini keys are near their RPM limit. Waiting 3s...")
+            time.sleep(3)
 
 def _build_prompt(problem_text: str, language: str = "") -> str:
     lang = (language or "Python3").strip()
     is_java = "java" in lang.lower()
+    is_c = bool(re.search(r"\bC\b|^\s*c\s*\(", lang, re.IGNORECASE)) and "c++" not in lang.lower() and "cpp" not in lang.lower()
     
-    java_constraint = ""
+    lang_constraint = ""
     if is_java:
-        java_constraint = """
+        lang_constraint = """
 ### JAVA CRITICAL RULES:
 - YOU MUST START WITH: `import java.util.*;`
 - YOU MUST DEFINE: `public class Hello { ... }`
 - THE MAIN METHOD MUST BE INSIDE `public class Hello`.
+- Read tokens safely with `Scanner sc = new Scanner(System.in);`.
 - NEVER output just the method body.
 """
+    elif is_c:
+        lang_constraint = """
+### C CRITICAL RULES:
+- YOU MUST INCLUDE: `#include <stdio.h>`, `#include <stdlib.h>`, `#include <string.h>`, `#include <math.h>`, `#include <ctype.h>`
+- YOU MUST DEFINE: `int main() { ... return 0; }`
+- BUFFER SIZE: ALWAYS use large buffers for string/line input: `char s[100005];` (never small buffers).
+- STRING INPUT WITH SPACES: When reading a string/line that may contain spaces, ALWAYS use `scanf(" %[^\n]", s);` or `fgets(s, sizeof(s), stdin); s[strcspn(s, "\\r\\n")] = 0;`.
+- NEVER use `gets()`.
+- NEVER output just snippets or functions without main().
+"""
+    else:
+        lang_constraint = """
+### PYTHON CRITICAL RULES:
+- Read input cleanly: for space-separated or multi-line tokens, use `sys.stdin.read().split()` or `sys.stdin.read().splitlines()`.
+- Format output EXACTLY as required. Do not print extra trailing spaces.
+- Pay attention to 1-based vs 0-based indexing as specified in problem examples.
+"""
 
-    return f"""TASK: Write a COMPLETE, RUNNABLE {lang} program.
+    return f"""TASK: Write a COMPLETE, RUNNABLE {lang} program for the problem below.
+    
+### LOGIC RULES:
+- EXAMPLES: Pay closest attention to the EXAMPLE INPUT and EXAMPLE OUTPUT. Your code must match the example outputs EXACTLY.
+- TEXT SOURCES: You will see 'WEB TEXT' and 'OCR TEXT'. Use WEB TEXT as the primary source, but verify examples from OCR.
+- FIX OCR TYPOS: Correct typos like 'MXN' to 'M x N' using problem context.
+- MATRIX ROTATION: CLOCKWISE: res[j][m-1-i]=mat[i][j] | ANTI-CLOCKWISE: res[n-1-j][i]=mat[i][j]
+- PATTERNS: For complex grids, pre-fill a 2D matrix before printing.
+- FORMATTING: Use exactly one space (' ') between values unless problem requires otherwise.
 
-### MANDATORY REQUIREMENTS:
-1. NO SNIPPETS. You MUST output the ENTIRE class from scratch.
-2. IMPORTANT: The problem description below may contain fragments of starter code (e.g., "1- import", "public class"). IGNORE THESE COMPLETELY. DO NOT try to complete them. Start from a blank slate.
-3. {java_constraint}
-4. JAVA INPUT: For reading matrices or lists of numbers, ALWAYS use `sc.nextInt()` in a loop. DO NOT use `sc.nextLine().split()` as it is fragile.
-5. OUTPUT SPACES: Ensure every number/character in the output is separated by a space as per the rules.
-6. NO EXPLANATIONS. NO MARKDOWN. NO COMMENTS. Just the raw code.
-7. MATCH EXAMPLES EXACTLY.
+### STRICTURE RULES:
+1. NO SNIPPETS. Output the ENTIRE class/program.
+2. {lang_constraint}
+3. NO EXPLANATIONS. Just raw code.
 
-### PROBLEM DESCRIPTION (WARNING: MAY CONTAIN FRAGMENTS TO IGNORE):
+### PROBLEM DESCRIPTION:
 {problem_text}
 
 ### OUTPUT START:
-(Write the FULL {lang} code here)
 """
 
 # ================= PROVIDERS =================
@@ -97,48 +131,113 @@ def _call_google(model_id: str, prompt: str) -> str:
     from google import genai
     from google.genai import types
     
-    # Get a key that hasn't exceeded 10 RPM
-    api_key = _get_next_valid_key()
-    client = genai.Client(api_key=api_key)
-    
     config = types.GenerateContentConfig(
         system_instruction="You are a competitive programming expert. Output ONLY raw code. No markdown. No explanations.",
         temperature=0.1,
     )
     
     errors = []
-    # Try the exact model ID, then common suffixed variants
-    variations = [
-        model_id,
-        f"{model_id}-latest",
-    ]
     
-    # Allow rotating through ALL keys in the pool if one fails
-    for retry_attempt in range(len(GEMINI_KEYS)):
+    # Preferred model variations to try in order on each key
+    candidate_variations = [
+        model_id,
+        "gemini-2.5-flash",
+        "gemini-3.6-flash",
+    ]
+    variations = []
+    for v in candidate_variations:
+        if v and v not in variations:
+            variations.append(v)
+    
+    available_keys = [k for k in GEMINI_KEYS if k not in _blacklisted_keys]
+    max_attempts = max(len(available_keys) * 2, 3)
+    
+    for attempt in range(max_attempts):
+        try:
+            api_key = _get_next_valid_key()
+        except RuntimeError as e:
+            raise RuntimeError(f"All Gemini keys exhausted or blacklisted: {e}")
+            
+        try:
+            client = genai.Client(api_key=api_key)
+        except Exception as e:
+            errors.append(f"Client init error on key {api_key[:8]}: {e}")
+            continue
+
         for mid in variations:
             try:
-                response = client.models.generate_content(model=mid, contents=prompt, config=config)
-                return response.text
+                response = client.models.generate_content(
+                    model=mid, 
+                    contents=prompt, 
+                    config=config
+                )
+                if response and response.text:
+                    return response.text
             except Exception as e:
                 err = str(e)
+                
+                # Check for permanent invalid / permission denied (dead project)
+                if "400" in err or "403" in err or "invalid" in err.lower() or "denied" in err.lower():
+                    print(f"[!] Key {api_key[:10]}... is invalid or banned ({err[:50]}). Blacklisting...")
+                    _blacklisted_keys.add(api_key)
+                    errors.append(f"Blacklisted key {api_key[:8]}")
+                    break # Break out of variations loop to try next key
+                
+                # Check for rate limit
                 if "429" in err or "quota" in err.lower():
-                    print(f"[!] Key {api_key[:10]}... hit rate limit. Rotating to key #{retry_attempt+1}...")
-                    api_key = _get_next_valid_key()
-                    client = genai.Client(api_key=api_key)
-                    break # Break inner loop to try NEW key
-                elif "API key not valid" in err or "400" in err or "403" in err:
-                    print(f"[!] Key {api_key[:10]}... failed ({err[:50]}). Trying next key...")
-                    api_key = _get_next_valid_key()
-                    client = genai.Client(api_key=api_key)
-                    break # Break inner loop
-                errors.append(err)
+                    errors.append(f"429 on {mid} (key {api_key[:8]})")
+                    print(f"[!] Key {api_key[:10]}... hit rate limit on {mid}. Trying next variation/key...")
+                    continue # Try next variation on this key (e.g. 2.5-flash) before moving to next key!
+                
+                # Model 404 / unsupported on this key -> try next variation on SAME key
+                if "404" in err or "not found" in err.lower():
+                    errors.append(f"404 on {mid} (key {api_key[:8]})")
+                    continue # Try next variation!
+                
+                errors.append(err[:80])
                 continue
-    
-    raise RuntimeError(f"Gemini failed on all {len(GEMINI_KEYS)} keys: {errors[0] if errors else 'Unknown error'}")
+
+    error_summary = ", ".join(list(dict.fromkeys(errors))[:5])
+    raise RuntimeError(f"Gemini failed across healthy keys. Errors: {error_summary or 'No response'}")
 
 def _call_groq(model_id: str, prompt: str) -> str:
-    # Groq is disabled as per user request to use ONLY Gemini
-    return ""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return ""
+    
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": model_id,
+            "messages": [
+                {
+                    "role": "system", 
+                    "content": (
+                        "You are a competitive programming expert. "
+                        "STRICT LOGIC RULES:\n"
+                        "1. EXAMPLES: Pay closest attention to the EXAMPLE INPUT and EXAMPLE OUTPUT. Your code must match them EXACTLY.\n"
+                        "2. C: ALWAYS include <stdio.h>, <stdlib.h>, <string.h>, <math.h>, <ctype.h>. Use 'int main() { ... return 0; }'.\n"
+                        "   BUFFER SIZE: Use char s[100005] for strings. Read string lines with scanf(\" %[^\\n]\", s) or fgets.\n"
+                        "3. PYTHON: Use sys.stdin.read().split() or sys.stdin.read().splitlines() for multi-token / multi-line inputs.\n"
+                        "4. JAVA: ALWAYS 'public class Hello'. Use 'Scanner sc = new Scanner(System.in);'.\n"
+                        "5. FORMATTING: One space (' ') between values unless specified otherwise. No trailing spaces.\n"
+                        "6. NO markdown, no explanations. Output ONLY raw code."
+                    )
+                },
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1
+        }
+        response = requests.post(url, headers=headers, json=data, timeout=30)
+        response.raise_for_status()
+        return response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception as e:
+        print(f"[!] Groq error: {e}")
+        return ""
 
 # ================= MAIN API =================
 
@@ -163,10 +262,17 @@ def _simple_fallback(problem_text: str, language: str = "") -> str | None:
         return "n = int(input()); print(''.join(str(i) for i in range(1, n+1)))"
     return None
 
-def generate_solution(problem_text: str, language: str = "", **kwargs) -> str:
+def generate_solution(problem_text: str, language: str = "", smart_priority: bool = False, **kwargs) -> str:
     prompt = _build_prompt(problem_text, language)
     
-    for model_info in MODELS:
+    # Filter models
+    current_models = MODELS[:]
+    
+    if smart_priority:
+        # Prioritize frontier reasoning models for repairs
+        current_models.sort(key=lambda x: "120b" in x["id"] or "2.5" in x["id"], reverse=True)
+    
+    for model_info in current_models:
         name = model_info["name"]
         provider = model_info["provider"]
         model_id = model_info["id"]
@@ -209,32 +315,28 @@ def generate_solution(problem_text: str, language: str = "", **kwargs) -> str:
                     if "import java.util" not in code_text:
                         code_text = "import java.util.*;\n" + code_text
                         
+                is_c = bool(re.search(r"\bC\b|^\s*c\s*\(", language, re.IGNORECASE)) and "c++" not in language.lower() and "cpp" not in language.lower()
+                if is_c:
+                    code_text = re.sub(r"```[a-zA-Z]*\n?", "", code_text).replace("```", "").strip()
+                    if "<stdio.h>" not in code_text:
+                        code_text = "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n#include <ctype.h>\n\n" + code_text
+
+                    # Guarantee that the program is enclosed in int main()
+                    if "main(" not in code_text and "main (" not in code_text:
+                        print("[!] C main() function missing. Wrapping body in int main() automatically...")
+                        headers = "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n#include <ctype.h>\n\n"
+                        body = re.sub(r"#include\s*<[^>]+>\s*", "", code_text).strip()
+                        code_text = headers + "int main() {\n" + body
+                        if not code_text.rstrip().endswith("}"):
+                            code_text += "\n    return 0;\n}\n"
+
                 return code_text.strip()
                 
         except Exception as e:
             err_str = str(e)
-            # Rate‑limit handling – respect retry‑after when present
             if "429" in err_str:
-                # Extract possible "try again in XmYs" hint
-                import re as _re
-                m = _re.search(r"try again in (\d+)m(\d+\.\d+)s", err_str)
-                if m:
-                    wait_sec = int(m.group(1)) * 60 + float(m.group(2))
-                else:
-                    # fallback wait time if no hint is present
-                    wait_sec = 30
-                print(f"[!] {name} RATE LIMIT REACHED (429). Waiting {wait_sec:.1f}s...")
-                time.sleep(wait_sec)
-                # retry the same model once more after the pause
-                try:
-                    if provider == "google":
-                        response = _call_google(model_id, prompt)
-                    else:
-                        response = _call_groq(model_id, prompt)
-                    if response:
-                        return response.strip()
-                except Exception:
-                    pass
+                print(f"[!] {name} hit rate limit (429). Instantly falling through to next model...")
+                continue
             else:
                 print(f"[!] {name} failed: {err_str[:120]}...")
                 continue
@@ -257,4 +359,5 @@ def generate_repair(problem_text: str, code: str, error_msg: str, language: str 
         f"Problem description:\n{problem_text}\n\n"
         f"Fix the code. Output ONLY the complete corrected {lang} program, no explanations."
     )
-    return generate_solution(repair_prompt, language=language)
+    # Always use the smarter model first for repairs
+    return generate_solution(repair_prompt, language=language, smart_priority=True)
