@@ -14,8 +14,8 @@ load_dotenv()
 # Gemini API Keys Pool (Rotating)
 # Only verified active keys are retained in default pool
 GEMINI_KEYS = [
-    "AQ.Ab8RN6LTzMQtKKhTkAne1NLcxqqluow6oxJ22gnAmuH0hJjZsA",
-    "AIzaSyDm2tlqjiZzePcRb17JUerIBY7F_ctvDaw"
+    "PASTE_GEMENI_API_KEYS",
+    "PASTE_GEMENI_API_KEYS"
 ]
 
 # Add primary key from .env if present
